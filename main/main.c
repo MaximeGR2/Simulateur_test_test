@@ -8,16 +8,17 @@
 #include "driver/ledc.h"
 #include "driver/i2s_std.h"
 
-static const char *TAG = "ADS131A04";
+static const char *TAG = "TAG";
 
 // ADS131A04 SPI Configuration
-#define PIN_NUM_MISO      2
-#define PIN_NUM_MOSI      7
-#define PIN_NUM_SCLK       6
-#define PIN_NUM_CS_ADC        17
-#define PIN_NUM_DRDY_ADC      23  // Data ready pin
+#define PIN_NUM_MISO        2
+#define PIN_NUM_MOSI        7
+#define PIN_NUM_SCLK        6
+#define PIN_NUM_CS_ADC      17
+#define PIN_NUM_CS_DAC      16
+#define PIN_NUM_DRDY_ADC    23  // Data ready pin
 
-#define SPI_CLOCK_HZ  8000000  // 8 MHz
+#define SPI_CLOCK_HZ  16384000  // 16.384 MHz
 
 // Frame size in fixed-frame mode with CRC disabled, 16-bit word length
 // Frame = 2 bytes (status) + 5 channels * 2 bytes = 12 bytes total
@@ -40,7 +41,8 @@ typedef struct {
     int16_t channel_data[NUM_CHANNELS];  // 5 channels of 16-bit data
 } ads131a04_frame_t;
 
-static spi_device_handle_t spi_handle;
+static spi_device_handle_t spi_handle_ADC;
+static spi_device_handle_t spi_handle_DAC;
 
 /**
  * @brief Send 16-bit command
@@ -59,7 +61,7 @@ esp_err_t ADC_send_cmd(uint16_t cmd)
         .rx_buffer = rx,
     };
     
-    esp_err_t ret = spi_device_transmit(spi_handle, &t);
+    esp_err_t ret = spi_device_transmit(spi_handle_ADC, &t);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "Sent cmd: 0x%04X, Response: 0x%04X", cmd, (rx[0] << 8) | rx[1]);
     }
@@ -113,11 +115,11 @@ void ADC_setup()
 
 
     // CLK1 register: select clock source (0x0D)
-    // Bit 7: clk source = 1 (sclk)
+    // Bit 7: clk source = 0 (CLKIN)
     // Bit 6-4: reserved = 000
     // Bits 3-1: clkin divider ratio = 100 (default)
     // Bit 0: Reserved = 0
-    ADC_write_reg(0x0D, 0x88);
+    ADC_write_reg(0x00, 0x88);
     vTaskDelay(pdMS_TO_TICKS(10));
     ESP_LOGI(TAG, "ICLK is SCLK");
 
@@ -150,7 +152,7 @@ esp_err_t spi_init(void) {
         .sclk_io_num = PIN_NUM_SCLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 32
+        .max_transfer_sz = 0 //Defaults to 4092 if 0 when DMA enabled
     };
     
     ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
@@ -161,8 +163,8 @@ esp_err_t spi_init(void) {
     ESP_LOGI("MAIN", "spi_bus_initialize");
     
     
-    // Configure SPI device
-    spi_device_interface_config_t devcfg = {
+    // Configure SPI device ADC
+    spi_device_interface_config_t devcfg_ADC = {
         .clock_speed_hz = SPI_CLOCK_HZ,
         .mode = 1,  // SPI mode 1 (CPOL=0, CPHA=1)
         .spics_io_num = PIN_NUM_CS_ADC,
@@ -170,17 +172,34 @@ esp_err_t spi_init(void) {
         .duty_cycle_pos = 128
     };
     
-    ret = spi_bus_add_device(SPI2_HOST, &devcfg, &spi_handle);
+    ret = spi_bus_add_device(SPI2_HOST, &devcfg_ADC, &spi_handle_ADC);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to add SPI device");
         return ret;
     }
-    ESP_LOGI("MAIN", "spi_bus_add_device");
+    ESP_LOGI("MAIN", "spi_bus_add_device_ADC");
 
-    // Configure DRDY pin as input
+    // Configure SPI device ADC
+    spi_device_interface_config_t devcfg_DAC = {
+        .clock_speed_hz = SPI_CLOCK_HZ,
+        .mode = 1,  // SPI mode 1 (CPOL=0, CPHA=1)
+        .spics_io_num = PIN_NUM_CS_DAC,
+        .queue_size = 1,
+        .duty_cycle_pos = 128
+    };
+
+    ret = spi_bus_add_device(SPI2_HOST, &devcfg_DAC, &spi_handle_DAC);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add SPI device");
+        return ret;
+    }
+    ESP_LOGI("MAIN", "spi_bus_add_device_DAC");
+
+
+    // Configure DRDY pin as output
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << PIN_NUM_DRDY_ADC),
-        .mode = GPIO_MODE_INPUT,
+        .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE
@@ -222,13 +241,13 @@ static int32_t convert_16bit_to_int32(uint8_t *data) {
  * @brief Read ADC frame from ADS131A04
  * 
  * Reads one complete frame in fixed-frame size mode with CRC disabled, 16-bit words.
- * Frame structure (10 bytes):
- * - Bytes 0-1: Response word (echoes previous command)
- * - Bytes 2-3: Status word
- * - Bytes 4-5: Channel 0 data (16-bit, MSB first)
- * - Bytes 6-7: Channel 1 data (16-bit, MSB first)
- * - Bytes 8-9: Channel 2 data (16-bit, MSB first)
- * Note: Only 3 channels fit in 10 bytes, CH3 requires reading next frame
+ * Frame structure (12 bytes):
+ * - Bytes 0-1: status word
+ * - Bytes 2-3: Channel 0 data (16-bit, MSB first)
+ * - Bytes 4-5: Channel 1 data (16-bit, MSB first)
+ * - Bytes 6-7: Channel 2 data (16-bit, MSB first)
+ * - Bytes 8-9: Channel 3 data (16-bit, MSB first)
+ * - Bytes 10-11: empty channel 0x00 (CRC disabled)
  */
 esp_err_t ads131a04_read_frame(ads131a04_frame_t *frame) {
     if (frame == NULL) {
@@ -256,7 +275,7 @@ esp_err_t ads131a04_read_frame(ads131a04_frame_t *frame) {
         .rx_buffer = rx_data
     };
     
-    esp_err_t ret = spi_device_transmit(spi_handle, &trans);
+    esp_err_t ret = spi_device_transmit(spi_handle_ADC, &trans);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "SPI transmission failed");
         return ret;
@@ -264,16 +283,13 @@ esp_err_t ads131a04_read_frame(ads131a04_frame_t *frame) {
     
 
     // Extract status word (bytes 0-1)
-    frame->status = (rx_data[2] << 8) | rx_data[3];
+    frame->status = (rx_data[0] << 8) | rx_data[1];
     
     // Extract channel data (16-bit each)
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         int offset = 2 + (i * BYTES_PER_CHANNEL);
         frame->channel_data[i] = convert_16bit_to_int32(&rx_data[offset]);
     }
-    
-    // For channel 3, we'd need to read another frame or increase frame size
-    frame->channel_data[3] = 0; // Placeholder
     
     return ESP_OK;
 }
@@ -286,28 +302,32 @@ void ads131a04_display_frame(const ads131a04_frame_t *frame) {
     
     // Show status word with bit details
     printf("Status Word:   0x%04X\n", frame->status);
-    printf("  LOCK:        %d\n", (frame->status >> 15) & 0x01);
-    printf("  RESYNC:      %d\n", (frame->status >> 14) & 0x01);
-    printf("  REG_MAP:     %d\n", (frame->status >> 13) & 0x01);
-    printf("  CRC_ERR:     %d\n", (frame->status >> 12) & 0x01);
-    printf("  CRC_TYPE:    %d\n", (frame->status >> 11) & 0x01);
-    printf("  RESET:       %d\n", (frame->status >> 10) & 0x01);
-    printf("  WLENGTH:     %d\n", (frame->status >> 8) & 0x03);
-    printf("  DRDY[3:0]:   0x%X\n", (frame->status >> 4) & 0x0F);
+    //printf("  LOCK:        %d\n", (frame->status >> 15) & 0x01);
+    //printf("  RESYNC:      %d\n", (frame->status >> 14) & 0x01);
+    //printf("  REG_MAP:     %d\n", (frame->status >> 13) & 0x01);
+    //printf("  CRC_ERR:     %d\n", (frame->status >> 12) & 0x01);
+    //printf("  CRC_TYPE:    %d\n", (frame->status >> 11) & 0x01);
+    //printf("  RESET:       %d\n", (frame->status >> 10) & 0x01);
+    //printf("  WLENGTH:     %d\n", (frame->status >> 8) & 0x03);
+    //printf("  DRDY[3:0]:   0x%X\n", (frame->status >> 4) & 0x0F);
     
     // Show channel data
     printf("\nChannel Data:\n");
-    for (int i = 0; i < 3; i++) {  // Only first 3 channels in 10-byte frame
+    for (int i = 0; i < 4; i++) {
         printf("  CH%d: %6ld (0x%04lX)\n", 
-               i, 
+               i+1, 
                (long)frame->channel_data[i],
                (unsigned long)(frame->channel_data[i] & 0xFFFF));
     }
+
+    // Show CRC data
+    printf("  CRC: %6ld (0x%04lX)\n", (long)frame->channel_data[4], (unsigned long)(frame->channel_data[4] & 0xFFFF));
+
     
     // Show channel data as voltage (VREF = 2.5V, Gain = 1)
     printf("\nChannel Voltages (VREF=2.5V, Gain=1):\n");
     float vref = 2.5;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         float voltage = (frame->channel_data[i] * vref) / 32768.0;  // 2^15
         printf("  CH%d: %+.6f V\n", i, voltage);
     }
@@ -315,10 +335,54 @@ void ads131a04_display_frame(const ads131a04_frame_t *frame) {
     printf("==========================================\n\n");
 }
 
+uint16_t voltage_to_dac(float voltage) {
+    if (voltage < 0.0f) printf("voltage to dac error: voltage invalide\n");
+    if (voltage > 5.0f) printf("voltage to dac error: voltage invalide\n");
+
+    return (uint16_t)((voltage / 5.0f) * 65535.0f);
+}
+
+/**
+ * @brief Write a 16-bit value to a given channel of DAC8563
+ * @param channel 0 for A, 1 for B (depending on how you wire / interpret)
+ * @param value 16-bit digital code to send
+ */
+esp_err_t dac8563_write(uint8_t channel, uint16_t value)
+{
+    // Build command byte: refer to datasheet, e.g. command for writing to DAC register
+    // According to examples, for DAC8563 the command codes might be:
+    //   0x18 = write to DAC A
+    //   0x19 = write to DAC B :contentReference[oaicite:4]{index=4}
+    uint8_t cmd = 0;
+    if (channel == 0) {
+        cmd = 0x18;
+    } else {
+        cmd = 0x19;
+    }
+
+    uint8_t txbuf[3];
+    txbuf[0] = cmd;
+    txbuf[1] = (value >> 8) & 0xFF;
+    txbuf[2] = value & 0xFF;
+
+    spi_transaction_t t = {
+        .length = 8 * 3,  // bits
+        .tx_buffer = txbuf,
+        .rx_buffer = NULL,
+    };
+
+    esp_err_t ret = spi_device_polling_transmit(spi_handle_DAC, &t);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPI transmit failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
 /**
  * @brief Main application
  */
 void app_main(void) {
+    
      i2s_chan_handle_t tx_handle;
 
     // Basic TX channel setup
@@ -354,6 +418,8 @@ void app_main(void) {
     // Now the MCLK pin outputs 16.384 MHz continuously
 
 
+//------------------------------------------------------------------//
+
     /*
     ledc_timer_config_t ledc_timer = {
         .speed_mode       = LEDC_LOW_SPEED_MODE,
@@ -374,19 +440,27 @@ void app_main(void) {
     };
     ledc_channel_config(&ledc_channel);
     */
-    
+//------------------------------------------------------------------//
+
+    setvbuf(stdin,  NULL, _IOLBF, 0);
+    setvbuf(stdout, NULL, _IOLBF, 0);
     
     esp_err_t ret;
-   // ads131a04_frame_t frame;
+    ads131a04_frame_t frame;
     
     ESP_LOGI(TAG, "Starting ADS131A04 test...");
     
-    // Initialize ADS131A04
+    // Initialize spi
     ret = spi_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Initialization failed");
         return;
     }
+
+    char input[32];
+    float value;
+    float value_A;
+    float value_B;
     
     // Wait for device to stabilize
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -394,14 +468,62 @@ void app_main(void) {
     ESP_LOGI(TAG, "Starting continuous read...");
     
     // Continuous read loop
-    //int success_count = 0;
-    //int fail_count = 0;
+    int success_count = 0;
+    int fail_count = 0;
     
     while (1) {
-        ESP_LOGI(TAG, "Checking DRDY pin level: %d (should be 0 when data ready)", 
-             gpio_get_level(PIN_NUM_DRDY_ADC));
+        // Ask for output value
+        printf("Enter float value (-7.5 to 7.5) for output");
+        fflush(stdout);
 
-             /*
+        if (fgets(input, sizeof(input), stdin) == NULL) {
+            vTaskDelay(200 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        input[strcspn(input, "\r\n")] = '\0';  // strip newline
+
+        if (sscanf(input, "%f", &value) == 1) {
+            ESP_LOGI(TAG, "Parsed value = %f", value);
+
+            value_A = (value + 7.5)/3;
+            value_B = 5-value_A;
+
+            printf("value_A = %f\n", value_A);
+            printf("value_B = %f\n", value_B);
+
+            uint16_t dac_output_a = voltage_to_dac(value_A);
+            printf("DAC_A Value: 0x%04X (%u)\n", dac_output_a, dac_output_a);
+            uint16_t dac_output_b = voltage_to_dac(value_B);
+            printf("DAC_B Value: 0x%04X (%u)\n", dac_output_b, dac_output_b);
+            
+            if (dac8563_write(0, dac_output_a) == ESP_OK) {
+                printf("Wrote to DAC A: 0x%04X\n", dac_output_a);
+            } else {
+                printf("SPI write failed\n");
+            }
+
+            if (dac8563_write(1, dac_output_b) == ESP_OK) {
+                printf("Wrote to DAC B: 0x%04X\n", dac_output_b);
+            } else {
+                printf("SPI write failed\n");
+            }
+        } else {
+            printf("Invalid hex input.\n");
+        }
+        //ESP_LOGI(TAG, "Checking DRDY pin level: %d (should be 0 when data ready)", 
+          //   gpio_get_level(PIN_NUM_DRDY_ADC));
+
+           gpio_set_level(PIN_NUM_DRDY_ADC, 0);
+
+        // Wait for approximately 96 clock cycles
+        // This is a rough estimation and may vary slightly due to cache, interrupts, etc.
+        // For more precise timing, consider using a hardware timer or RMT peripheral.
+        //for (volatile int i = 0; i < 96; i++) {
+            // Empty loop for delay
+        
+
+
         ret = ads131a04_read_frame(&frame);
         if (ret == ESP_OK) {
             success_count++;
@@ -415,7 +537,29 @@ void app_main(void) {
                 ESP_LOGE(TAG, "Multiple failures.");
             }
         }
-        */
-        vTaskDelay(pdMS_TO_TICKS(50));  // Read every 500ms
+
+
+
+        // Set GPIO high
+        gpio_set_level(PIN_NUM_DRDY_ADC, 1);
+
+        
+        /*
+        ret = ads131a04_read_frame(&frame);
+        if (ret == ESP_OK) {
+            success_count++;
+            ads131a04_display_frame(&frame);
+        } else {
+            fail_count++;
+            ESP_LOGE(TAG, "Failed to read frame: %s (Success: %d, Failed: %d)", 
+                     esp_err_to_name(ret), success_count, fail_count);
+            
+            if (fail_count > 5 && success_count == 0) {
+                ESP_LOGE(TAG, "Multiple failures.");
+            }
+        }
+            */
+        
+        //vTaskDelay(pdMS_TO_TICKS(50));  // Read every 500ms
     }
 }
