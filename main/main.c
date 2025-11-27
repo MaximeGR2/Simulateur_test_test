@@ -45,101 +45,6 @@ static spi_device_handle_t spi_handle_ADC;
 static spi_device_handle_t spi_handle_DAC;
 
 /**
- * @brief Send 16-bit command
- */
-esp_err_t ADC_send_cmd(uint16_t cmd)
-{
-    uint8_t tx[FRAME_SIZE_BYTES] = {0};
-    uint8_t rx[FRAME_SIZE_BYTES];
-    
-    tx[0] = (cmd >> 8) & 0xFF;
-    tx[1] = cmd & 0xFF;
-    
-    spi_transaction_t t = {
-        .length = FRAME_SIZE_BYTES * 8,  // bits
-        .tx_buffer = tx,
-        .rx_buffer = rx,
-    };
-    
-    esp_err_t ret = spi_device_transmit(spi_handle_ADC, &t);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Sent cmd: 0x%04X, Response: 0x%04X", cmd, (rx[0] << 8) | rx[1]);
-    }
-    return ret;
-}
-
-/**
- * @brief Write to register (WREG command)
- */
-esp_err_t ADC_write_reg(uint8_t reg_addr, uint8_t data)
-{
-    // WREG command format: 010a aaaa dddd dddd
-    // Bits 15-13: 010 (WREG command)
-    // Bits 12-8: register address (5 bits)
-    // Bits 7-0: sent data (8 bits)
-    uint16_t cmd = 0x4000 | ((reg_addr & 0x1F) << 7) | (data);
-    
-    ESP_LOGI(TAG, "Writing reg 0x%02X = 0x%04X (cmd: 0x%04X)", reg_addr, data, cmd);
-    
-    return ADC_send_cmd(cmd);
-}
-
-/**
- * @brief Setup ADC registers
- */
-void ADC_setup()
-{
-    ESP_LOGI(TAG, "Starting ADC setup...");
-    
-    // Wake up ADC
-    ADC_send_cmd(ADS131A04_CMD_WAKEUP);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    ESP_LOGI(TAG, "ADC WAKEUP sent");
-
-    // Unlock registers
-    ADC_send_cmd(ADS131A04_CMD_UNLOCK);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    ESP_LOGI(TAG, "ADC UNLOCK sent");
-
-    // Configure D_SYS_CFG register (0x0C) - Fixed words frames
-    // D_SYS_CFG:
-    // Bit 7: watchdog timer enable = 0 (default)
-    // Bit 6: CRC_MODE = 0 (default)
-    // Bit 5-4: DNDLY = 11 (default)
-    // Bit 3-2: HIZDLY = 11 (default)
-    // Bit 1: FIXED = 1 (fixed six words data frames)
-    // Bit 0: CRC_EN = 0 (disabled, default)
-    ADC_write_reg(0x0C, 0x3E);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    ESP_LOGI(TAG, "ADC Fixed words enable");
-
-
-    // CLK1 register: select clock source (0x0D)
-    // Bit 7: clk source = 0 (CLKIN)
-    // Bit 6-4: reserved = 000
-    // Bits 3-1: clkin divider ratio = 100 (default)
-    // Bit 0: Reserved = 0
-    ADC_write_reg(0x00, 0x88);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    ESP_LOGI(TAG, "ICLK is SCLK");
-
-    //Enable all channels
-    //ADC_ENA register(0x0F)
-    // Bit 7-4: Reserved = 0000
-    // Bit 3-0: ENA = 1111 (All ADC channels powered up)
-    ADC_write_reg(0x0F, 0x0F);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    ESP_LOGI(TAG, "ALL CHANNELS POWERED UP");
-
-    // Lock registers
-    ADC_send_cmd(ADS131A04_CMD_LOCK);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    ESP_LOGI(TAG, "ADC LOCK sent");
-    
-    ESP_LOGI(TAG, "ADC setup complete");
-}
-
-/**
  * @brief Initialize SPI interface for ADS131A04
  */
 esp_err_t spi_init(void) {
@@ -210,10 +115,56 @@ esp_err_t spi_init(void) {
     
     // Setup ADC after SPI initialization
     vTaskDelay(pdMS_TO_TICKS(100));
-    ADC_setup();
+  
     
     return ESP_OK;
 }
+
+/**
+ * @brief Send 16-bit command
+ */
+esp_err_t ADC_send_cmd(uint16_t cmd)
+{
+
+    uint8_t tx[FRAME_SIZE_BYTES] = {0};
+    uint8_t rx[FRAME_SIZE_BYTES];
+    
+    tx[0] = (cmd >> 8) & 0xFF;
+    tx[1] = cmd & 0xFF;
+    
+    spi_transaction_t t = {
+        .length = FRAME_SIZE_BYTES * 8,  // bits
+        .tx_buffer = tx,
+        .rx_buffer = rx,
+    };
+
+    gpio_set_level(PIN_NUM_DRDY_ADC, 0);
+    
+    esp_err_t ret = spi_device_transmit(spi_handle_ADC, &t);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Sent cmd: 0x%04X, Response: 0x%04X", cmd, (rx[0] << 8) | rx[1]);
+    }
+
+    gpio_set_level(PIN_NUM_DRDY_ADC, 1);
+    return ret;
+}
+
+/**
+ * @brief Write to register (WREG command)
+ */
+esp_err_t ADC_write_reg(uint8_t reg_addr, uint8_t data)
+{
+    // WREG command format: 010a aaaa dddd dddd
+    // Bits 15-13: 010 (WREG command)
+    // Bits 12-8: register address (5 bits)
+    // Bits 7-0: sent data (8 bits)
+    uint16_t cmd = 0x4000 | ((reg_addr & 0x1F) << 7) | (data);
+    
+    ESP_LOGI(TAG, "Writing reg 0x%02X = 0x%04X (cmd: 0x%04X)", reg_addr, data, cmd);
+    
+    return ADC_send_cmd(cmd);
+}
+
 
 /**
  * @brief Wait for data ready signal
@@ -254,11 +205,12 @@ esp_err_t ads131a04_read_frame(ads131a04_frame_t *frame) {
         return ESP_ERR_INVALID_ARG;
     }
     
+    /*
     // Wait for data ready
     if (!ads131a04_wait_drdy(1000)) {
         ESP_LOGW(TAG, "Timeout waiting for DRDY, pin level: %d", gpio_get_level(PIN_NUM_DRDY_ADC));
         return ESP_ERR_TIMEOUT;
-    }
+    }*/
     
     // Prepare buffers
     uint8_t tx_data[FRAME_SIZE_BYTES] = {0};
@@ -275,12 +227,15 @@ esp_err_t ads131a04_read_frame(ads131a04_frame_t *frame) {
         .rx_buffer = rx_data
     };
     
+    gpio_set_level(PIN_NUM_DRDY_ADC, 0);
+
     esp_err_t ret = spi_device_transmit(spi_handle_ADC, &trans);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "SPI transmission failed");
         return ret;
     }
     
+    gpio_set_level(PIN_NUM_DRDY_ADC, 1);
 
     // Extract status word (bytes 0-1)
     frame->status = (rx_data[0] << 8) | rx_data[1];
@@ -290,9 +245,92 @@ esp_err_t ads131a04_read_frame(ads131a04_frame_t *frame) {
         int offset = 2 + (i * BYTES_PER_CHANNEL);
         frame->channel_data[i] = convert_16bit_to_int32(&rx_data[offset]);
     }
-    
+
     return ESP_OK;
 }
+
+/**
+ * @brief Setup ADC registers
+ */
+void ADC_setup(ads131a04_frame_t *frame)
+{
+    ESP_LOGI(TAG, "Starting ADC setup...");
+
+    while(frame->status != 0xFF04){
+        ads131a04_read_frame(&frame);
+    }
+
+    // Unlock registers
+    ADC_send_cmd(ADS131A04_CMD_UNLOCK);
+    ESP_LOGI(TAG, "ADC UNLOCK sent");
+
+    if(ads131a04_read_frame(&frame) == 0x0655){
+        ESP_LOGI(TAG, "unlock status received");
+    }
+    
+    
+    // Configure D_SYS_CFG register (0x0C) - Fixed words frames
+    // D_SYS_CFG:
+    // Bit 7: watchdog timer enable = 0 (default)
+    // Bit 6: CRC_MODE = 0 (default)
+    // Bit 5-4: DNDLY = 11 (default)
+    // Bit 3-2: HIZDLY = 11 (default)
+    // Bit 1: FIXED = 1 (fixed six words data frames)
+    // Bit 0: CRC_EN = 0 (disabled, default)
+    ADC_write_reg(0x0C, 0x3E);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ESP_LOGI(TAG, "ADC Fixed words enable");
+
+    if(ads131a04_read_frame(&frame) == 0x4C3E){
+        ESP_LOGI(TAG, "D_SYS_CFG register write status received");
+    }
+
+
+    // CLK1 register: select clock source (0x0D)
+    // Bit 7: clk source = 0 (CLKIN)
+    // Bit 6-4: reserved = 000
+    // Bits 3-1: clkin divider ratio = 100 (default)
+    // Bit 0: Reserved = 0
+    //ADC_write_reg(0x0D, 0x08);
+    //vTaskDelay(pdMS_TO_TICKS(10));
+    //ESP_LOGI(TAG, "ICLK is SCLK");
+
+
+    // Enable all channels
+    // ADC_ENA register(0x0F)
+    // Bit 7-4: Reserved = 0000
+    // Bit 3-0: ENA = 1111 (All ADC channels powered up)
+    ADC_write_reg(0x0F, 0x0F);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ESP_LOGI(TAG, "ALL CHANNELS POWERED UP");
+
+     if(ads131a04_read_frame(&frame) == 0x4F0F){
+        ESP_LOGI(TAG, "Channel enable register write status received");
+    }
+
+     // Wake up ADC
+    ADC_send_cmd(ADS131A04_CMD_WAKEUP);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ESP_LOGI(TAG, "ADC WAKEUP sent");
+    
+    if(ads131a04_read_frame(&frame) == 0x0033){
+        ESP_LOGI(TAG, "WAKEUP status received");
+    }
+
+
+    // Lock registers
+    ADC_send_cmd(ADS131A04_CMD_LOCK);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ESP_LOGI(TAG, "ADC LOCK sent");
+
+    if(ads131a04_read_frame(&frame) == 0x0555){
+        ESP_LOGI(TAG, "LOCK status received");
+    }
+
+    ESP_LOGI(TAG, "ADC setup complete");
+}
+
+
 
 /**
  * @brief Display frame data with all extracted words
@@ -300,17 +338,11 @@ esp_err_t ads131a04_read_frame(ads131a04_frame_t *frame) {
 void ads131a04_display_frame(const ads131a04_frame_t *frame) {
     printf("\n========== ADS131A04 Frame Data ==========\n");
     
-    // Show status word with bit details
+
+    // Show status word
     printf("Status Word:   0x%04X\n", frame->status);
-    //printf("  LOCK:        %d\n", (frame->status >> 15) & 0x01);
-    //printf("  RESYNC:      %d\n", (frame->status >> 14) & 0x01);
-    //printf("  REG_MAP:     %d\n", (frame->status >> 13) & 0x01);
-    //printf("  CRC_ERR:     %d\n", (frame->status >> 12) & 0x01);
-    //printf("  CRC_TYPE:    %d\n", (frame->status >> 11) & 0x01);
-    //printf("  RESET:       %d\n", (frame->status >> 10) & 0x01);
-    //printf("  WLENGTH:     %d\n", (frame->status >> 8) & 0x03);
-    //printf("  DRDY[3:0]:   0x%X\n", (frame->status >> 4) & 0x0F);
     
+
     // Show channel data
     printf("\nChannel Data:\n");
     for (int i = 0; i < 4; i++) {
@@ -378,12 +410,13 @@ esp_err_t dac8563_write(uint8_t channel, uint16_t value)
     return ret;
 }
 
+
 /**
  * @brief Main application
  */
 void app_main(void) {
     
-     i2s_chan_handle_t tx_handle;
+    i2s_chan_handle_t tx_handle;
 
     // Basic TX channel setup
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
@@ -457,13 +490,15 @@ void app_main(void) {
         return;
     }
 
+    ADC_setup(&frame);
+
     char input[32];
     float value;
     float value_A;
     float value_B;
     
     // Wait for device to stabilize
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(100));
     
     ESP_LOGI(TAG, "Starting continuous read...");
     
@@ -511,18 +546,16 @@ void app_main(void) {
         } else {
             printf("Invalid hex input.\n");
         }
-        //ESP_LOGI(TAG, "Checking DRDY pin level: %d (should be 0 when data ready)", 
-          //   gpio_get_level(PIN_NUM_DRDY_ADC));
 
-           gpio_set_level(PIN_NUM_DRDY_ADC, 0);
+        //gpio_set_level(PIN_NUM_DRDY_ADC, 0);
 
         // Wait for approximately 96 clock cycles
         // This is a rough estimation and may vary slightly due to cache, interrupts, etc.
         // For more precise timing, consider using a hardware timer or RMT peripheral.
+
         //for (volatile int i = 0; i < 96; i++) {
             // Empty loop for delay
         
-
 
         ret = ads131a04_read_frame(&frame);
         if (ret == ESP_OK) {
@@ -541,7 +574,7 @@ void app_main(void) {
 
 
         // Set GPIO high
-        gpio_set_level(PIN_NUM_DRDY_ADC, 1);
+        //gpio_set_level(PIN_NUM_DRDY_ADC, 1);
 
         
         /*
